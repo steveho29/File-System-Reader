@@ -1,71 +1,26 @@
 from struct import unpack
 from FAT32Functions import*
+from FAT32STRUCTURE import*
+
+BYTES_PER_SECTOR = 512
 
 
-class BootFat32:
-    bootSector = {  # { offset: (name, unpack string) }
-        0x00: ('JumpInstruction', '3s'),
-        0x03: ('OemID', '8s'),
-        0x0B: ('BytesPerSector', '<H'),
-        0x0D: ('SectorsPerCluster', 'B'),
-        0x0E: ('SectorsOfBootSector', '<H'),
-        0x10: ('FATCopies', 'B'),
-        0x11: ('MaxRootEntries', '<H'),
-        0x13: ('TotalSectors', '<H'),
-        0x15: ('MediaDescriptor', 'B'),
-        0x16: ('SectorsPerFAT', '<H'),  # not used, see 24h instead
-        0x18: ('SectorsPerTrack', '<H'),
-        0x1A: ('Heads', '<H'),
-        0x1C: ('HiddenSectors', '<H'),
-        0x1E: ('TotalHiddenSectors', '<H'),
-        0x20: ('TotalLogicalSectors', '<I'),
-        0x24: ('SectorsPerFAT', '<I'),
-        0x28: ('MirroringFlags', '<H'),  # bits 0-3: active FAT, it bit 7 set; else: mirroring as usual
-        0x2A: ('Version', '<H'),
-        0x2C: ('RootCluster', '<I'),  # usually 2
-        0x30: ('FSISector', '<H'),  # usually 1
-        0x32: ('BootCopySector', '<H'),  # 0x0000 or 0xFFFF if unused, usually 6
-        0x34: ('Reserved', '12s'),
-        0x40: ('PhysDriveNumber', 'B'),
-        0x41: ('Flags', 'B'),
-        0x42: ('ExtBootSignature', 'B'),
-        0x43: ('VolumeID', '<I'),
-        0x47: ('VolumeLabel', '11s'),
-        0x52: ('FSType', '8s'),
-        # ~ 0x72: ('chBootstrapCode', '390s'),
-        0x1FE: ('BootSignature', '<H')  # 55 AA
-    }
-
-    mainEntry = {
-        0x00: ('Name', '8s'),
-        0x08: ('Extension name', '3s'),
-        0x0B: ('Status', 'B'),
-        0x0C: ('For', 'B'),
-        0x0D: ('Created Time', '<I'),
-        0x10: ('Created Date', '<H'),
-        0x12: ('Latest Access', '<H'),
-        0x14: ('Start Cluster', '<H'),
-        0x16: ('Latest Modified Time', '<H'),
-        0x18: ('Latest Modified Day', '<H'),
-        0x1A: ('Start Cluster Low', '<H'),
-        0x1C: ('Size', '<I'),
-    }
-
-    subEntry = {
-        0x00: ('Order Number', 'B'),
-        0x01: ('5 chars Unicode', '10s'),
-        0xB: ('SubEntry Signature', 'B'),
-        0xE: ('6 next chars', '12s'),
-        0x1C: ('2 next chars', '4s')
-
-    }
+class Fat32:
 
     def __init__(self, disk_path):
         self.diskPath = disk_path
-        self.offset_name = {}  # { name: offset}
+        self.bootSector = {}  # { name: offset}
         self.size = 0
+        self.sectorStartRDET = None
+        self.sectorPerCluster = None
+        self.bytesPerSector = None
+        self.FATTable = b''
+        self.rootFolder = []
+        self.treeFiles = [[], []]
+        self.diskName = ''
 
         self.read_boot_sector(self.diskPath)
+
 
     def get_boot_sector(self, diskPath):
         with open(diskPath, 'rb') as fp:
@@ -75,7 +30,7 @@ class BootFat32:
 
     def read_boot_sector(self, diskPath):
         boot_sector = self.get_boot_sector(diskPath)
-        layout = list(self.bootSector.copy().items())
+        layout = list(bootSectorStructure.items())
         for i, (start_offset, info) in enumerate(layout):
             if start_offset == 0x52:
                 end_offset = 0x5A
@@ -84,22 +39,22 @@ class BootFat32:
             else:
                 end_offset = layout[i + 1][0]
 
-            self.offset_name[info[0]] = unpack(info[1], boot_sector[start_offset:end_offset])[0]
+            self.bootSector[info[0]] = unpack(info[1], boot_sector[start_offset:end_offset])[0]
 
-        total_sectors = self.offset_name['TotalLogicalSectors']
-        bytes_per_sectors = self.offset_name['BytesPerSector']
-        self.size = float(total_sectors * bytes_per_sectors / (2.0 ** 30))
+        total_sectors = self.bootSector['TotalLogicalSectors']
+        self.bytesPerSector = self.bootSector['BytesPerSector']
+        self.size = float(total_sectors * self.bytesPerSector / (2.0 ** 30))
+        self.sectorPerCluster = self.bootSector['SectorsPerCluster']
 
     def show_info(self):
-
-        for name_offset, data in list(self.offset_name.items()):
+        for name_offset, data in list(self.bootSector.items()):
             print('{}: {}'.format(name_offset, data))
         print('Total size: {} gb'.format(self.size))
 
     def read_subEntry(self, entry):
         extendedName = ''
         data = {}
-        layout = list(self.subEntry.items())
+        layout = list(subEntryStructure.items())
         for i, (start_offset, (name, formatType)) in enumerate(layout):
             if start_offset == 0x1C:
                 end_offset = 0x1C + 4
@@ -116,13 +71,13 @@ class BootFat32:
         return extendedName
 
     def read_main_entry(self, entry):
-        mainEntry = list(self.mainEntry.items())
+        mainEntryData = list(mainEntryStructure.items())
         data = {}
-        for i, (start_offset, (name, formatType)) in enumerate(mainEntry):
-            if i == len(mainEntry) - 1:
+        for i, (start_offset, (name, formatType)) in enumerate(mainEntryData):
+            if i == len(mainEntryData) - 1:
                 end_offset = 0x20
             else:
-                end_offset = mainEntry[i + 1][0]
+                end_offset = mainEntryData[i + 1][0]
             if name == 'Created Time':
                 info = unpack(formatType, entry[start_offset:end_offset] + b'\x00')[0]
 
@@ -138,28 +93,110 @@ class BootFat32:
 
             else:
                 data[name] = info
-
+        data['Name'] = data['Name']
         return data
 
+    def readSDET(self, startSector, endSector, fp):
+        for i in range(startSector-self.sectorStartRDET):
+            fp.read(self.bytesPerSector)
+
+        # print(self.bytesPerSector)
+        # print(startSector, endSector)
+        n = (endSector - startSector) * int((self.bytesPerSector / 32)) - 2
+        # print(n)
+        files = []
+        folders = []
+        # x = fp.tell()
+        fp.read(64)    # skip 2 first entry in SDET
+
+        for i in range(n):
+            entry = fp.read(32)
+            status = unpack('B', entry[0:1])[0]
+            if status == 229:
+                continue
+            elif status == 0:
+                break
+
+            status = unpack('B', entry[0x0B:0x0C])[0]
+
+            if status != 15:
+                if not isValidFile(status) or isHiddened(status):
+                    continue
+                mainEntry = self.read_main_entry(entry)
+
+                # print(mainEntry)
+                name = mainEntry['Name']
+                extendedName = mainEntry['Extension name']
+                if isFile(mainEntry['Status']):
+                    mainEntry['Name'] = name.decode('utf-8').strip(' ') + '.' + extendedName.decode('utf-8').strip(' ')
+                else:
+                    mainEntry['Name'] = (name + extendedName).decode('utf-8').strip(' ')
+            else:
+                extendedName = ''
+                extendedName = self.read_subEntry(entry) + extendedName
+                entry = fp.read(32)
+                isSubEntry = unpack('B', entry[0x0B:0x0C])[0] == 15
+                while isSubEntry:
+                    extendedName = self.read_subEntry(entry) + extendedName
+                    entry = fp.read(32)
+                    isSubEntry = unpack('B', entry[0x0B:0x0C])[0] == 15
+
+                mainEntry = self.read_main_entry(entry)
+                if not isValidFile(mainEntry['Status']) or isHiddened(mainEntry['Status']):
+                    continue
+                mainEntry['Name'] = extendedName
+                mainEntry.pop('Extension name')
+
+                # for atb in mainEntry:
+                #     print('{}: {}'.format(atb, mainEntry[atb]), end='\t')
+                # print()
+
+            if mainEntry['Status'] == 16:
+                folders.append(mainEntry)
+            elif mainEntry['Status'] == 32:
+                files.append(mainEntry)
+
+        fp.close()
+        return files, folders
+
     def read_rdet(self):
-        sectorStart = self.offset_name['SectorsOfBootSector']+2 * self.offset_name['SectorsPerFAT']
+        SF = self.bootSector['SectorsPerFAT']
+        sectorStart = self.bootSector['SectorsOfBootSector']
+        bytesPerSector = self.bootSector['BytesPerSector']
+        self.sectorStartRDET = SF*2 + sectorStart
+
         with open(self.diskPath, 'rb') as fp:
             for i in range(sectorStart):
-                fp.read(512)
-            for i in range(512):
+                fp.read(bytesPerSector)
+
+            tmp = []
+            for i in range(SF):
+                tmp.append(fp.read(bytesPerSector))
+            self.FATTable = b''.join(tmp)
+
+            for i in range(SF):
+                fp.read(bytesPerSector)
+
+            while True:
                 entry = fp.read(32)
                 status = unpack('B', entry[0:1])[0]
-                if status == 0 or status == 229:
+                if status == 229:
                     continue
-                if unpack('B', entry[0x0B:0x0C])[0] != 15:
+                elif status == 0:
+                    break
+                status = unpack('B', entry[0x0B:0x0C])[0]
+                # print(status)
+
+                if status != 15:
+                    if not isValidFile(status) or isHiddened(status):
+                        continue
                     mainEntry = self.read_main_entry(entry)
                     mainEntry['Name'] = mainEntry['Name'].decode('utf-8').strip(' ')
                     extendedName = mainEntry['Extension name'].decode('utf-8').strip(' ')
                     if isFile(mainEntry['Status']):
                         mainEntry['Name'] += '.' + extendedName
-
-                    mainEntry['Name'] += ' ' + extendedName
-
+                    else:
+                        mainEntry['Name'] += ' ' + extendedName
                 else:
                     extendedName = ''
                     extendedName = self.read_subEntry(entry) + extendedName
@@ -170,16 +207,103 @@ class BootFat32:
                         entry = fp.read(32)
                         isSubEntry = unpack('B', entry[0x0B:0x0C])[0] == 15
                     mainEntry = self.read_main_entry(entry)
+                    if not isValidFile(mainEntry['Status']) or isHiddened(mainEntry['Status']):
+                        continue
                     mainEntry['Name'] = extendedName
                 mainEntry.pop('Extension name')
 
-                for atb in mainEntry:
-                    print('{}: {}'.format(atb, mainEntry[atb]), end='\t')
-                print()
+                # if isHiddened(mainEntry['Status']):
+                #     continue
+                # else:
+                # for atb in mainEntry:
+                #     print('{}: {}'.format(atb, mainEntry[atb]), end='\t')
+                # print()
+
+                if mainEntry['Status'] == 16:
+                    self.rootFolder.append(mainEntry)
+                elif mainEntry['Status'] == 32:
+                    self.treeFiles[0].append(mainEntry)
+
         fp.close()
 
+    def getFolderTree(self):
+        # print(self.rootFolder)
+        for data in self.rootFolder:
+            self.readFolder_2(data)
+            # self.treeFiles[1].append(self.readFolder(data))
 
-drive = r"\\.\D:"
-b = BootFat32(drive)
-# b.show_info() 
+        for file in self.treeFiles[0]:
+            print(file['Name'])
+        #
+        # for folder in self.treeFiles[1]:
+        #     self.printFolderTree(folder)
+
+    def printFolderTree(self, folders, space=0):
+        # tree = {root: (folderInfo, files, [])}
+
+        for root in folders:
+            data = folders[root]
+            print(' ' * space, end='')
+            print(data[0]['Name'])
+            space += 10
+            for file in data[1]:
+                print(' ' * space, end='')
+                print(file['Name'])
+            for subFolder in data[2]:
+                self.printFolderTree(subFolder, space)
+
+    def getRDETPointer(self):
+        SF = self.bootSector['SectorsPerFAT']
+        sectorStart = self.bootSector['SectorsOfBootSector']
+        bytesPerSector = self.bootSector['BytesPerSector']
+        fp = open(self.diskPath, 'rb')
+        for i in range(sectorStart):
+            fp.read(bytesPerSector)
+        for i in range(SF*2):
+            fp.read(bytesPerSector)
+        return fp
+
+    def readFolder(self, folder):
+        fp = self.getRDETPointer()
+        # print(folder['Name'])
+        # print(folder['Start Cluster Low'])
+        start_cluster = getStartCluster(folder['Start Cluster Low'], folder['Start Cluster High'])
+        # print(start_cluster)
+        clusters = getClusterFromFAT(start_cluster, self.FATTable)
+        # print(clusters)
+        # print(self.sectorStartRDET)
+        start_sector, end_sector = getSectors(2, self.sectorStartRDET, self.sectorPerCluster, clusters)
+        files, folders = self.readSDET(start_sector, end_sector, fp)
+
+        root = folder['Name'].strip('\x00')
+        # tree = {root: (folder, files, [{str(f['Name'].strip('\x00')): (f, [], []) for f in folders}])}
+        tree = {root: (folder, files, [])}
+        # print(tree[root])
+        if folders:
+            for i, f in enumerate(folders):
+                tree[root][2].append(self.readFolder(f))
+        return tree
+
+    def readFolder_2(self, folder, space=0):
+        fp = self.getRDETPointer()
+        start_cluster = getStartCluster(folder['Start Cluster Low'], folder['Start Cluster High'])
+        clusters = getClusterFromFAT(start_cluster, self.FATTable)
+        start_sector, end_sector = getSectors(2, self.sectorStartRDET, self.sectorPerCluster, clusters)
+        files, folders = self.readSDET(start_sector, end_sector, fp)
+        print(' ' * space, end='')
+        space += 5
+        print(folder['Name'])
+        for file in files:
+            print(' '*space, end='')
+            print(file['Name'])
+
+        for i, f in enumerate(folders):
+            self.readFolder_2(f, space)
+
+
+drive = r"\\.\E:"
+
+b = Fat32(drive)
+b.show_info()
 b.read_rdet()
+b.getFolderTree()
