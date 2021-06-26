@@ -69,7 +69,8 @@ def getStartCluster(low, high):
 
 def checkCluster(data):
     next_cluster = unpack('<I', data)[0]
-    if (b'\xff\xff\x0f' or b'\xff\xff\xff\xff') in data or next_cluster == 0:
+    check = [b'\xFF\xFF\xFF\x0F', b'\xFF\xFF\xFF\xFF']
+    if data in check or next_cluster == 0:
         return False
     return next_cluster
 
@@ -79,11 +80,10 @@ def getClusterFromFAT(start_cluster, FAT):
     # print(start_cluster)
     block = FAT[start_cluster*4:start_cluster*4+4]
     next_cluster = checkCluster(block)
-    # print(next_cluster)
+
     while next_cluster:
         clusters.append(next_cluster)
-        block = FAT[start_cluster * 4:start_cluster*4 + 4]
+        block = FAT[next_cluster * 4:next_cluster * 4 + 4]
         next_cluster = checkCluster(block)
-        # print(next_cluster)
 
     return clusters
