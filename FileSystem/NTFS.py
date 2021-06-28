@@ -32,7 +32,7 @@ class NTFSPartitionBoot:
 
     def __init__(self, disk_path):
         self.diskPath = disk_path
-        self.offset_name = {}  # { name: offset}
+        self.bootSector = {}  # { name: offset}
         self.size = 0
 
         self.MFT_start=0
@@ -57,26 +57,25 @@ class NTFSPartitionBoot:
                 end_offset = layout[i + 1][0]
 
             # print(info)
-            self.offset_name[info[0]] = unpack(info[1], boot_sector[start_offset:end_offset])[0]
+            self.bootSector[info[0]] = unpack(info[1], boot_sector[start_offset:end_offset])[0]
 
-        total_sectors = self.offset_name['TotalSectors']
-        bytes_per_sectors = self.offset_name['BytesPerSector']
+        total_sectors = self.bootSector['TotalSectors']
+        bytes_per_sectors = self.bootSector['BytesPerSector']
         self.size = float(total_sectors * bytes_per_sectors / (2.0 ** 30))
 
-        self.MFT_start =int(self.offset_name['BytesPerSector'] * self.offset_name['SectorsPerCluster'] * self.offset_name['MFTClusterNumber'])
+        self.MFT_start =int(self.bootSector['BytesPerSector'] * self.bootSector['SectorsPerCluster'] * self.bootSector['MFTClusterNumber'])
 
-
-    def show_info(self,list_name):
-        for name_offset, data in list(list_name.items()):
-            print('{}: {}'.format(name_offset, data))
+    def show_info(self):
+        for name_offset in self.bootSector:
+            print('{}: {}'.format(name_offset, self.bootSector[name_offset]))
         #print('Total size: {} gb'.format(self.size))
         #print('MFT START: {}'.format (self.MFT_start))
 
 
     def read_rdet(self):
-        numberSector = (self.offset_name['RootCluster']) * self.offset_name['SectorsPerCluster']
+        numberSector = (self.bootSector['RootCluster']) * self.bootSector['SectorsPerCluster']
         print(numberSector)
-        bytePerSector = self.offset_name['BytesPerSector']
+        bytePerSector = self.bootSector['BytesPerSector']
         start_offset = numberSector * bytePerSector
         start_offset = 1 * bytePerSector
         print(start_offset)
@@ -256,6 +255,7 @@ class NTFSPartitionBoot:
 
 drive = r"\\.\C:"
 b = NTFSPartitionBoot(drive)
-b.Read_MFT()
-#b.show_info()
+# b.Read_MFT()
+# b.read_boot_sector()
+b.show_info()
 # b.read_rdet()

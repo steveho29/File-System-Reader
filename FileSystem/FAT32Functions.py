@@ -53,14 +53,13 @@ def getDate(x):
     return '{}-{}-{}'.format(day, month, year)
 
 
-def getSectors(start_cluster, start_sector, sectorPerCluster, clusters):
+def getSectors(clusterStartRDET, sectorStartRDET, sectorPerCluster, clusters):
     sectors = []
     for cluster in clusters:
-        sector = (cluster - start_cluster) * sectorPerCluster + start_sector
-        sectors.append(sector)
-    if len(sectors) == 1:
-        return sectors[0], sectors[0]+sectorPerCluster
-    return sectors[0], sectors[-1]+sectorPerCluster
+        sector = (cluster - clusterStartRDET) * sectorPerCluster + sectorStartRDET
+        for i in range(sectorPerCluster):
+            sectors.append(sector+i)
+    return sectors
 
 
 def getStartCluster(low, high):
@@ -68,8 +67,10 @@ def getStartCluster(low, high):
 
 
 def checkCluster(data):
+    if not data:
+        return False
     next_cluster = unpack('<I', data)[0]
-    check = [b'\xFF\xFF\xFF\x0F', b'\xFF\xFF\xFF\xFF']
+    check = [b'\xFF\xFF\xFF\x0F', b'\xff\xff\xff\xff', b'\xf8\xff\xff\x0f']
     if data in check or next_cluster == 0:
         return False
     return next_cluster
@@ -77,8 +78,8 @@ def checkCluster(data):
 
 def getClusterFromFAT(start_cluster, FAT):
     clusters = [start_cluster]
-    # print(start_cluster)
     block = FAT[start_cluster*4:start_cluster*4+4]
+    # print(block)
     next_cluster = checkCluster(block)
 
     while next_cluster:
@@ -86,4 +87,8 @@ def getClusterFromFAT(start_cluster, FAT):
         block = FAT[next_cluster * 4:next_cluster * 4 + 4]
         next_cluster = checkCluster(block)
 
+    if next_cluster == b'\xff\xff\xff\xff':
+        clusters.append(next_cluster)
     return clusters
+
+

@@ -1,13 +1,204 @@
-from struct import unpack
 from FAT32Functions import *
 from FAT32STRUCTURE import *
+from PyQt5.QtCore import QThread, pyqtSignal
+from threading import Thread
+
+fileOrder = 1
+
+NUMBER_THREAD = 4
 
 
+def read_main_entry(entry):
+    mainEntryData = list(mainEntryStructure.items())
+    data = {}
+    for i, (start_offset, (name, formatType)) in enumerate(mainEntryData):
+        if i == len(mainEntryData) - 1:
+            end_offset = 0x20
+        else:
+            end_offset = mainEntryData[i + 1][0]
+        if name == 'Created Time':
+            info = unpack(formatType, entry[start_offset:end_offset] + b'\x00')[0]
 
-class Fat32:
+        else:
+            info = unpack(formatType, entry[start_offset:end_offset])[0]
 
-    def __init__(self, disk_path):
-        self.diskPath = disk_path
+        if name == 'Created Date' or name == 'Latest Modified Day' or name == 'Latest Access':
+            data[name] = getDate(info)
+        elif name == 'Latest Modified Time':
+            data[name] = getTime(info)
+        elif name == 'Created Time':
+            data[name] = getTimeCreated(info)
+
+        else:
+            data[name] = info
+    data['Name'] = data['Name']
+    return data
+
+
+def read_subEntry(entry):
+    extendedName = ''
+    data = {}
+    layout = list(subEntryStructure.items())
+    for i, (start_offset, (name, formatType)) in enumerate(layout):
+        if start_offset == 0x1C:
+            end_offset = 0x1C + 4
+        elif start_offset == 0x01:
+            end_offset = 0x01 + 10
+        elif start_offset == 0xE:
+            end_offset = 0xE + 12
+        else:
+            continue
+
+        data[name] = unpack(formatType, entry[start_offset:end_offset])[0]
+        extendedName += data[name].decode('UTF-16').strip('￿')
+    # print(extendedName)
+    return extendedName
+
+
+class TXTReaderThread(QThread):
+    finish = pyqtSignal(object)
+
+    def __init__(self, disk, sectors, bytesPerSector):
+        super(TXTReaderThread, self).__init__()
+        self.sectors = sectors
+        self.bytesPerSector = bytesPerSector
+        self.diskPath = r'\\.\{}:'.format(disk)
+
+    def run(self):
+        fp = open(self.diskPath, 'rb')
+        # print(self.sectors)
+        file = []
+        for sector in self.sectors:
+            fp.seekable()
+            fp.seek(sector*self.bytesPerSector)
+            print(fp.tell())
+            file.append(fp.read(self.bytesPerSector))
+
+        file = b''.join(file)
+        try:
+            file = file[:file.index(b'\x00')].decode('utf-8')
+        except:
+            file = file.decode('utf-8')
+
+        fp.close()
+        # print(file)
+        self.finish.emit(file)
+
+
+class DFSThread(QThread):
+    finish = pyqtSignal(object)
+    fileSignal = pyqtSignal(object)
+
+    def __init__(self, diskPath, FATTable, sectorStartRDET, clusterStartRDET, rootFolder, bytesPerSector, sectorPerCluster):
+        super(DFSThread, self).__init__()
+        self.diskPath = diskPath
+        self.diskName = diskPath.strip(r'\\.\:')
+        self.rootFolder = rootFolder
+        self.maxSector = 0
+        self.bytesPerSector = bytesPerSector
+        self.clusterStartRDET = clusterStartRDET
+        self.sectorStartRDET = sectorStartRDET
+        self.sectorPerCluster = sectorPerCluster
+        self.FATTable = FATTable
+
+    def DFS_SDET(self, rootData, sector_start, sector_end, space=0):
+        fp = open(self.diskPath, 'rb')
+        fp.seekable()
+        fp.seek(sector_start * self.bytesPerSector)
+        fp.read(64)
+
+        space += 10
+        n = int((sector_end - sector_start + 1) * self.bytesPerSector/32)
+
+        for i in range(n):
+            entry = fp.read(32)
+            status = unpack('B', entry[0:1])[0]
+            if status == 229:
+                continue
+            elif status == 0:
+                break
+
+            status = unpack('B', entry[0x0B:0x0C])[0]
+
+            if status != 15:
+                if not isValidFile(status):
+                    continue
+                mainEntry = read_main_entry(entry)
+
+                name = mainEntry['Name']
+                extendedName = mainEntry['Extension name']
+                if isFile(mainEntry['Status']):
+                    mainEntry['Name'] = name.decode('utf-8').strip(' ') + '.' + extendedName.decode('utf-8').strip(
+                        ' ').strip('\x00')
+                else:
+                    mainEntry['Name'] = (name + extendedName).decode('utf-8').strip('\x00')
+            else:
+                extendedName = ''
+                extendedName = read_subEntry(entry) + extendedName.strip('\x00')
+                entry = fp.read(32)
+
+                isSubEntry = unpack('B', entry[0x0B:0x0C])[0] == 15
+                while isSubEntry:
+                    extendedName = read_subEntry(entry) + extendedName.strip('\x00')
+                    entry = fp.read(32)
+                    isSubEntry = unpack('B', entry[0x0B:0x0C])[0] == 15
+
+                status_1 = unpack('B', entry[0:1])[0]
+                if status_1 == 0 or status_1 == 229:
+                    continue
+                mainEntry = read_main_entry(entry)
+
+                if not isValidFile(mainEntry['Status']):
+                    continue
+                mainEntry['Name'] = extendedName.strip('\x00')
+
+                mainEntry.pop('Extension name')
+
+                # for atb in mainEntry:
+                #     print('{}: {}'.format(atb, mainEntry[atb]), end='\t')
+                # print()
+
+            print(' ' * space, end='')
+            print(mainEntry['Name'])
+            start_cluster = getStartCluster(mainEntry['Start Cluster Low'], mainEntry['Start Cluster High'])
+            clusters = getClusterFromFAT(start_cluster, self.FATTable)
+            subFileSectors = getSectors(self.clusterStartRDET, self.sectorStartRDET,
+                                                  self.sectorPerCluster, clusters)
+
+            mainEntry['Name'] = mainEntry['Name'].strip()
+            mainEntry['Sectors'] = subFileSectors
+            mainEntry['Clusters'] = clusters
+            mainEntry['rootIndex'] = rootData['index']
+            mainEntry['Disk'] = self.diskName
+            mainEntry['Path'] = rootData['Path'] + '\\' + mainEntry['Name']
+
+            global fileOrder
+            mainEntry['index'] = fileOrder
+            fileOrder += 1
+
+            self.fileSignal.emit(mainEntry.copy())
+
+            if mainEntry['Status'] == 16:
+                self.DFS_SDET(mainEntry, subFileSectors[0], subFileSectors[-1], space)
+
+    def run(self):
+        start_sector, end_sector = int(self.rootFolder['Sectors'][0]), int(self.rootFolder['Sectors'][-1])
+
+        self.DFS_SDET(self.rootFolder, start_sector, end_sector)
+        self.finish.emit(True)
+
+
+class Fat32(QThread):
+    fileSignal = pyqtSignal(object)
+    rootSignal = pyqtSignal(object)
+    diskSignal = pyqtSignal(object)
+    threads = []
+
+    def __init__(self, diskName):
+        super(Fat32, self).__init__()
+        self.diskPath = r'\\.\{}:'.format(diskName)
+        self.diskName = diskName
+        self.volumeName = ''
         self.bootSector = {}  # { name: offset}
         self.size = 0
         self.sectorStartRDET = None
@@ -16,20 +207,46 @@ class Fat32:
         self.FATTable = b''
         self.rootFolder = []
         self.treeFiles = [[], []]
-        self.diskName = ''
         self.maxSector = 0
         self.clusterStartRDET = None
+        self.fileOrder = 1
+        self.index = 0
+        # self.read_boot_sector(self.diskPath)
 
-        self.read_boot_sector(self.diskPath)
+    def finish(self, res):
+        if self.index < len(self.rootFolder):
+            fp = self.getRDETPointer()
+            t = DFSThread(self.sectorStartRDET, self.clusterStartRDET, self.FATTable, self.rootFolder[self.index], self.bytesPerSector, self.sectorPerCluster, fp)
+            self.index += 1
+            t.fileSignal.connect(self.updateFile)
+            self.threads.append(t)
+            t.start()
 
-    def get_boot_sector(self, diskPath):
-        with open(diskPath, 'rb') as fp:
+    def updateFile(self, file):
+        self.fileSignal.emit(file)
+
+    def run(self):
+        self.read_boot_sector()
+        self.rootSignal.emit((self.diskName, self.volumeName))
+        self.diskSignal.emit((self.bootSector, self.diskName))
+        self.show_info()
+        self.read_rdet()
+
+        n = len(self.rootFolder)
+        while self.index < n and self.index < NUMBER_THREAD:
+            folder = self.rootFolder[self.index]
+            print(folder['Name'])
+            t = DFSThread(self.diskPath, self.FATTable, self.sectorStartRDET, self.clusterStartRDET, folder, self.bytesPerSector, self.sectorPerCluster)
+            t.finish.connect(self.finish)
+            t.fileSignal.connect(self.updateFile)
+            self.threads.append(t)
+            self.index += 1
+            t.start()
+
+    def read_boot_sector(self):
+        with open(self.diskPath, 'rb') as fp:
             boot_sector = fp.read(512)
         fp.close()
-        return boot_sector
-
-    def read_boot_sector(self, diskPath):
-        boot_sector = self.get_boot_sector(diskPath)
         layout = list(bootSectorStructure.items())
         for i, (start_offset, info) in enumerate(layout):
             if start_offset == 0x52:
@@ -46,204 +263,13 @@ class Fat32:
         self.size = float(total_sectors * self.bytesPerSector / (2.0 ** 30))
         self.sectorPerCluster = self.bootSector['SectorsPerCluster']
         self.clusterStartRDET = self.bootSector['RootCluster']
+        self.volumeName = self.bootSector['VolumeLabel'].decode('utf-8')
+        self.bootSector['Size'] = '{} gb'.format(self.size)
 
     def show_info(self):
         for name_offset, data in list(self.bootSector.items()):
             print('{}: {}'.format(name_offset, data))
         print('Total size: {} gb'.format(self.size))
-
-    def read_subEntry(self, entry):
-        extendedName = ''
-        data = {}
-        layout = list(subEntryStructure.items())
-        for i, (start_offset, (name, formatType)) in enumerate(layout):
-            if start_offset == 0x1C:
-                end_offset = 0x1C + 4
-            elif start_offset == 0x01:
-                end_offset = 0x01 + 10
-            elif start_offset == 0xE:
-                end_offset = 0xE + 12
-            else:
-                continue
-
-            data[name] = unpack(formatType, entry[start_offset:end_offset])[0]
-            extendedName += data[name].decode('UTF-16').strip('￿')
-        # print(extendedName)
-        return extendedName
-
-    def read_main_entry(self, entry):
-        mainEntryData = list(mainEntryStructure.items())
-        data = {}
-        for i, (start_offset, (name, formatType)) in enumerate(mainEntryData):
-            if i == len(mainEntryData) - 1:
-                end_offset = 0x20
-            else:
-                end_offset = mainEntryData[i + 1][0]
-            if name == 'Created Time':
-                info = unpack(formatType, entry[start_offset:end_offset] + b'\x00')[0]
-
-            else:
-                info = unpack(formatType, entry[start_offset:end_offset])[0]
-
-            if name == 'Created Date' or name == 'Latest Modified Day' or name == 'Latest Access':
-                data[name] = getDate(info)
-            elif name == 'Latest Modified Time':
-                data[name] = getTime(info)
-            elif name == 'Created Time':
-                data[name] = getTimeCreated(info)
-
-            else:
-                data[name] = info
-        data['Name'] = data['Name']
-        return data
-
-    def readSDET(self, startSector, endSector, fp):
-        for i in range(startSector - self.sectorStartRDET):
-            fp.read(self.bytesPerSector)
-
-        # print(self.bytesPerSector)
-        # print(startSector, endSector)
-        n = (endSector - startSector) * int((self.bytesPerSector / 32)) - 2
-        # print(n)
-        files = []
-        folders = []
-        # x = fp.tell()
-        fp.read(64)  # skip 2 first entry in SDET
-
-        for i in range(n):
-            entry = fp.read(32)
-            status = unpack('B', entry[0:1])[0]
-            if status == 229:
-                continue
-            elif status == 0:
-                break
-
-            status = unpack('B', entry[0x0B:0x0C])[0]
-
-            if status != 15:
-                if not isValidFile(status) or isHiddened(status):
-                    continue
-                mainEntry = self.read_main_entry(entry)
-
-                # print(mainEntry)
-                name = mainEntry['Name']
-                extendedName = mainEntry['Extension name']
-                if isFile(mainEntry['Status']):
-                    mainEntry['Name'] = name.decode('utf-8').strip(' ') + '.' + extendedName.decode('utf-8').strip(' ')
-                else:
-                    mainEntry['Name'] = (name + extendedName).decode('utf-8').strip(' ')
-            else:
-                extendedName = ''
-                extendedName = self.read_subEntry(entry) + extendedName
-                entry = fp.read(32)
-                isSubEntry = unpack('B', entry[0x0B:0x0C])[0] == 15
-                while isSubEntry:
-                    extendedName = self.read_subEntry(entry) + extendedName
-                    entry = fp.read(32)
-                    isSubEntry = unpack('B', entry[0x0B:0x0C])[0] == 15
-
-                mainEntry = self.read_main_entry(entry)
-                if not isValidFile(mainEntry['Status']) or isHiddened(mainEntry['Status']):
-                    continue
-                mainEntry['Name'] = extendedName
-                mainEntry.pop('Extension name')
-
-                # for atb in mainEntry:
-                #     print('{}: {}'.format(atb, mainEntry[atb]), end='\t')
-                # print()
-
-            if mainEntry['Status'] == 16:
-                folders.append(mainEntry)
-            elif mainEntry['Status'] == 32:
-                files.append(mainEntry)
-
-        fp.close()
-        return files, folders
-
-    def DFS_SDET(self, rootSector, startSector, endSector, fp, space=0):
-        rootFp = fp.tell()
-        p = (startSector - rootSector)
-        if endSector <= self.maxSector:
-            # print(startSector*self.bytesPerSector)
-            fp.seek(startSector*self.bytesPerSector)
-        else:
-            fp.read(self.bytesPerSector*p)
-            self.maxSector = endSector
-
-        subFp = fp.tell()
-        fp.read(64)
-        n = (endSector - startSector) * int((self.bytesPerSector / 32)) - 2
-        space += 10
-        x1 = fp.tell()
-        for i in range(n):
-            entry = fp.read(32)
-            status = unpack('B', entry[0:1])[0]
-            if status == 229:
-                continue
-            elif status == 0:
-                break
-
-            status = unpack('B', entry[0x0B:0x0C])[0]
-
-            if status != 15:
-                if not isValidFile(status):
-                    continue
-                mainEntry = self.read_main_entry(entry)
-
-                # print(mainEntry)
-                name = mainEntry['Name']
-                extendedName = mainEntry['Extension name']
-                if isFile(mainEntry['Status']):
-                    mainEntry['Name'] = name.decode('utf-8').strip(' ') + '.' + extendedName.decode('utf-8').strip(' ')
-                else:
-                    mainEntry['Name'] = (name + extendedName).decode('utf-8').strip(' ')
-                    # mainEntry['Name'] = name.decode('utf-8').strip(' ') + ' ' + extendedName.decode('utf-8').strip(' ')
-            else:
-                extendedName = ''
-                extendedName = self.read_subEntry(entry) + extendedName
-                entry = fp.read(32)
-
-                isSubEntry = unpack('B', entry[0x0B:0x0C])[0] == 15
-                while isSubEntry:
-                    extendedName = self.read_subEntry(entry) + extendedName
-                    entry = fp.read(32)
-                    isSubEntry = unpack('B', entry[0x0B:0x0C])[0] == 15
-                # c += 1
-
-                mainEntry = self.read_main_entry(entry)
-                if not isValidFile(mainEntry['Status']):
-                    continue
-                mainEntry['Name'] = extendedName
-                mainEntry.pop('Extension name')
-
-                # for atb in mainEntry:
-                #     print('{}: {}'.format(atb, mainEntry[atb]), end='\t')
-                # print()
-
-            print(' ' * space, end='')
-            print(mainEntry['Name'])
-            if mainEntry['Status'] == 16:
-                start_cluster = getStartCluster(mainEntry['Start Cluster Low'], mainEntry['Start Cluster High'])
-                clusters = getClusterFromFAT(start_cluster, self.FATTable)
-                start_sector, end_sector = getSectors(self.clusterStartRDET, self.sectorStartRDET, self.sectorPerCluster, clusters)
-
-                x = fp.tell()
-                # print(x1)
-                # fp.seekable()
-                # fp.seek(x1)
-                fp.seekable()
-                fp.seek(subFp)
-                self.DFS_SDET(startSector, start_sector, end_sector, fp, space)
-                fp.seekable()
-                fp.seek(subFp)
-                fp.read(64)
-                fp.seekable()
-                fp.seek(x)
-
-        fp.seekable()
-        fp.seek(subFp)
-        fp.seekable()
-        fp.seek(rootFp)
 
     def read_rdet(self):
         SF = self.bootSector['SectorsPerFAT']
@@ -252,30 +278,27 @@ class Fat32:
         self.sectorStartRDET = SF * 2 + sectorStart
 
         with open(self.diskPath, 'rb') as fp:
-            for i in range(sectorStart):
-                fp.read(bytesPerSector)
-
+            fp.seekable()
+            fp.seek(sectorStart*bytesPerSector)
             tmp = []
+
             for i in range(SF):
                 tmp.append(fp.read(bytesPerSector))
             self.FATTable = b''.join(tmp)
 
-            for i in range(SF):
-                fp.read(bytesPerSector)
+            fp.seekable()
+            fp.seek(sectorStart*bytesPerSector+2*SF*bytesPerSector)
 
             clusters = getClusterFromFAT(self.clusterStartRDET, self.FATTable)
-            # print(clusters)
-            startSector, endSector = getSectors(self.clusterStartRDET, self.sectorStartRDET, self.sectorPerCluster, clusters)
-            # print(startSector, endSector)
-            n = (endSector - startSector) * int((self.bytesPerSector / 32)) - 2
-
+            sectors = getSectors(self.clusterStartRDET, self.sectorStartRDET, self.sectorPerCluster, clusters)
+            # print(sectors)
+            n = (sectors[-1] - sectors[0]) * int((self.bytesPerSector / 32)) - 2
             for i in range(n):
                 entry = fp.read(32)
                 status_1 = unpack('B', entry[0:1])[0]
                 if status_1 == 229:
                     continue
                 status = unpack('B', entry[0x0B:0x0C])[0]
-                # print(status)
                 if status == 0:
                     continue
 
@@ -284,9 +307,9 @@ class Fat32:
                         break
                     if not isValidFile(status):
                         continue
-                    mainEntry = self.read_main_entry(entry)
+                    mainEntry = read_main_entry(entry)
                     mainEntry['Name'] = mainEntry['Name'].decode('utf-8').strip(' ')
-                    extendedName = mainEntry['Extension name'].decode('utf-8').strip(' ')
+                    extendedName = mainEntry['Extension name'].decode('utf-8').strip(' ').strip('\x00')
                     if isFile(mainEntry['Status']):
                         mainEntry['Name'] += '.' + extendedName
                     else:
@@ -294,18 +317,18 @@ class Fat32:
 
                 else:
                     extendedName = ''
-                    extendedName = self.read_subEntry(entry) + extendedName
+                    extendedName = read_subEntry(entry) + extendedName.strip('\x00')
                     entry = fp.read(32)
                     isSubEntry = unpack('B', entry[0x0B:0x0C])[0] == 15
                     while isSubEntry:
-                        extendedName = self.read_subEntry(entry) + extendedName
+                        extendedName = read_subEntry(entry) + extendedName.strip('\x00')
                         entry = fp.read(32)
                         isSubEntry = unpack('B', entry[0x0B:0x0C])[0] == 15
 
                     status_1 = unpack('B', entry[0:1])[0]
                     if status_1 == 0 or status_1 == 229:
                         continue
-                    mainEntry = self.read_main_entry(entry)
+                    mainEntry = read_main_entry(entry)
 
                     if not isValidFile(mainEntry['Status']):
                         continue
@@ -315,10 +338,26 @@ class Fat32:
                 checkName = mainEntry['Name'].split()[0]
                 if checkName == '.' or checkName == '..':
                     continue
+
                 for atb in mainEntry:
                     print('{}: {}'.format(atb, mainEntry[atb]), end='\t')
                 print()
 
+                global fileOrder
+                mainEntry['index'] = fileOrder
+                fileOrder += 1
+
+                mainEntry['rootIndex'] = 0
+                start_cluster = getStartCluster(mainEntry['Start Cluster Low'], mainEntry['Start Cluster High'])
+                subFileclusters = getClusterFromFAT(start_cluster, self.FATTable)
+                subFileSectors = getSectors(self.clusterStartRDET, self.sectorStartRDET,
+                                                      self.sectorPerCluster, subFileclusters)
+                mainEntry['Name'] = mainEntry['Name'].strip()
+                mainEntry['Sectors'] = subFileSectors
+                mainEntry['Clusters'] = subFileclusters
+                mainEntry['Disk'] = self.diskName
+                mainEntry['Path'] = self.diskName + ':\\' + mainEntry['Name']
+                self.fileSignal.emit(mainEntry.copy())
                 if mainEntry['Status'] == 16:
                     self.rootFolder.append(mainEntry)
                 elif mainEntry['Status'] == 32:
@@ -326,100 +365,10 @@ class Fat32:
 
         fp.close()
 
-    def getFolderTree(self):
-        # print(self.rootFolder)
-        fp = self.getRDETPointer()
-        for file in self.treeFiles[0]:
-            print(file['Name'])
-
-        self.rootFolder.reverse()
-        for folder in self.rootFolder:
-            # print(folder)
-            # continue
-            print(folder['Name'])
-            start_cluster = getStartCluster(folder['Start Cluster Low'], folder['Start Cluster High'])
-            clusters = getClusterFromFAT(start_cluster, self.FATTable)
-            start_sector, end_sector = getSectors(self.clusterStartRDET, self.sectorStartRDET, self.sectorPerCluster, clusters)
-
-            self.DFS_SDET(self.sectorStartRDET, start_sector, end_sector, fp)
-            # self.readFolder_2(data)
-            # self.treeFiles[1].append(self.readFolder(data))
-        fp.close()
-
-        #
-        # for folder in self.treeFiles[1]:
-        #     self.printFolderTree(folder)
-
-    def printFolderTree(self, folders, space=0):
-        # tree = {root: (folderInfo, files, [])}
-
-        for root in folders:
-            data = folders[root]
-            print(' ' * space, end='')
-            print(data[0]['Name'])
-            space += 10
-            for file in data[1]:
-                print(' ' * space, end='')
-                print(file['Name'])
-            for subFolder in data[2]:
-                self.printFolderTree(subFolder, space)
-
-    def getRDETPointer(self):
-        # SF = self.bootSector['SectorsPerFAT']
-        # sectorStart = self.bootSector['SectorsOfBootSector']
-        # bytesPerSector = self.bootSector['BytesPerSector']
-        fp = open(self.diskPath, 'rb')
-        fp.seekable()
-        fp.seek(self.sectorStartRDET*self.bytesPerSector)
-        # for i in range(sectorStart):
-        #     fp.read(bytesPerSector)
-        # for i in range(SF * 2):
-        #     fp.read(bytesPerSector)
-        return fp
-
-    def readFolder(self, folder):
-        fp = self.getRDETPointer()
-        # print(folder['Name'])
-        # print(folder['Start Cluster Low'])
-        start_cluster = getStartCluster(folder['Start Cluster Low'], folder['Start Cluster High'])
-        # print(start_cluster)
-        clusters = getClusterFromFAT(start_cluster, self.FATTable)
-        # print(clusters)
-        # print(self.sectorStartRDET)
-        start_sector, end_sector = getSectors(2, self.sectorStartRDET, self.sectorPerCluster, clusters)
-        files, folders = self.readSDET(start_sector, end_sector, fp)
-
-        root = folder['Name'].strip('\x00')
-        # tree = {root: (folder, files, [{str(f['Name'].strip('\x00')): (f, [], []) for f in folders}])}
-        tree = {root: (folder, files, [])}
-        # print(tree[root])
-        if folders:
-            for i, f in enumerate(folders):
-                tree[root][2].append(self.readFolder(f))
-        return tree
-
-    def readFolder_2(self, folder, space=0):
-        fp = self.getRDETPointer()
-        start_cluster = getStartCluster(folder['Start Cluster Low'], folder['Start Cluster High'])
-        clusters = getClusterFromFAT(start_cluster, self.FATTable)
-        start_sector, end_sector = getSectors(2, self.sectorStartRDET, self.sectorPerCluster, clusters)
-        files, folders = self.readSDET(start_sector, end_sector, fp)
-        print(' ' * space, end='')
-        space += 5
-        print(folder['Name'])
-        for file in files:
-            print(' ' * space, end='')
-            print(file['Name'])
-
-        for i, f in enumerate(folders):
-            self.readFolder_2(f, space)
 
 
-drive = r"\\.\E:"
 
-b = Fat32(drive)
-b.show_info()
-b.read_rdet()
-b.getFolderTree()
+
+
 
 
