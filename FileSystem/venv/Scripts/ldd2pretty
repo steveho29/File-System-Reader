@@ -1,3 +1,0 @@
-#!C:\Users\Kobe\Desktop\FileSystem\venv\Scripts\python.exe
-from ldapdomaindump import pretty
-pretty.main()
